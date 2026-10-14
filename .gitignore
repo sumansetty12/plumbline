@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+.venv/
+.env
+trust.json
+contract.json
+request.json

@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest>=8
+moto[sts,iam,cloudtrail]>=5

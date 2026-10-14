@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IssueSessionsForContractRolesOnly",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/contractor-*"
+    },
+    {
+      "Sid": "RevokeOlderSessionsOnContractRoles",
+      "Effect": "Allow",
+      "Action": "iam:PutRolePolicy",
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/contractor-*"
+    },
+    {
+      "Sid": "ReadContractorPrincipals",
+      "Effect": "Allow",
+      "Action": ["iam:ListRoles", "iam:ListRoleTags", "iam:GetRole", "iam:ListUsers", "iam:ListUserTags"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadActivity",
+      "Effect": "Allow",
+      "Action": "cloudtrail:LookupEvents",
+      "Resource": "*"
+    }
+  ]
+}

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plumbline</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1b1f24; --mute:#5b6570; --line:#dfe2e6; --accent:#1f5f8b;
+          --low:#2e7d32; --medium:#b26a00; --high:#c62828; --critical:#7b1fa2; --info:#5b6570; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171a; --card:#1d2227; --ink:#e8eaed; --mute:#9aa4af; --line:#2f363d; --accent:#6bb3e0;
+            --low:#66bb6a; --medium:#e0a030; --high:#ef6c6c; --critical:#ce93d8; --info:#9aa4af; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
+  header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  main { max-width:960px; margin:0 auto; padding:16px; }
+  nav button, .btn { border:1px solid var(--line); background:var(--card); color:var(--ink); padding:6px 12px; border-radius:6px; cursor:pointer; font:inherit; }
+  nav button.on { border-color:var(--accent); color:var(--accent); font-weight:600; }
+  .btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .btn.danger { color:var(--high); border-color:var(--high); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin:10px 0; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .tag { font-size:12px; padding:1px 8px; border-radius:10px; border:1px solid currentColor; }
+  .mute { color:var(--mute); } .small { font-size:13px; }
+  input { padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--ink); font:inherit; min-width:220px; }
+  pre { white-space:pre-wrap; word-break:break-word; background:var(--bg); padding:8px; border-radius:6px; font-size:12px; margin:6px 0 0; }
+  ul { margin:6px 0; padding-left:20px; }
+  #msg { margin:10px 0; min-height:1.4em; }
+  .ok { color:var(--low); } .bad { color:var(--high); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Plumbline</h1>
+  <input id="key" type="password" placeholder="API key" autocomplete="off">
+  <button class="btn primary" id="signin">Sign in</button>
+  <span id="who" class="mute small"></span>
+  <nav id="tabs" class="row" hidden></nav>
+</header>
+<main>
+  <div id="msg" role="status"></div>
+  <div id="view"></div>
+</main>
+<script>
+"use strict";
+let KEY = "", ME = null, TAB = "requests";
+const $ = (id) => document.getElementById(id);
+try { KEY = sessionStorage.getItem("plb-key") || ""; } catch (e) {}
+
+function el(tag, attrs, ...kids) {           // all text goes through textContent: events are untrusted data
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") n.className = v; else if (k === "onclick") n.addEventListener("click", v); else n.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) if (c != null) n.append(c.nodeType ? c : document.createTextNode(String(c)));
+  return n;
+}
+function say(text, good) { const m = $("msg"); m.textContent = text || ""; m.className = good ? "ok" : "bad"; }
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { "X-API-Key": KEY, "Content-Type": "application/json", ...(opts.headers || {}) } });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || data.detail || ("HTTP " + r.status));
+  return data;
+}
+const sevTag = (s) => el("span", { class: "tag", style: "color:var(--" + (["low","medium","high","critical","info"].includes(s) ? s : "info") + ")" }, s);
+
+async function signIn() {
+  KEY = $("key").value || KEY;
+  try {
+    ME = await api("/me");
+    try { sessionStorage.setItem("plb-key", KEY); } catch (e) {}
+    $("who").textContent = ME.name + " (" + ME.role + ")";
+    const tabs = ME.role === "contractor" ? ["requests", "grants"] : ["requests", "grants", "findings", "audit"];
+    $("tabs").hidden = false; $("tabs").replaceChildren(...tabs.map(t => el("button", { class: t === TAB ? "on" : "", onclick: () => { TAB = t; signIn(); } }, t)));
+    say("", true); render();
+  } catch (e) { say(e.message); }
+}
+async function render() {
+  const v = $("view"); v.replaceChildren();
+  try {
+    if (TAB === "requests") return v.append(...(await requests()));
+    if (TAB === "grants") return v.append(...(await grants()));
+    if (TAB === "findings") return v.append(...(await findings()));
+    if (TAB === "audit") return v.append(...(await audit()));
+  } catch (e) { say(e.message); }
+}
+async function act(path, body, okText) {
+  try { const r = await api(path, { method: "POST", body: JSON.stringify(body || {}) }); say(okText, true); await render(); return r; }
+  catch (e) { say(e.message); }
+}
+async function requests() {
+  const list = await api("/requests");
+  if (!list.length) return [el("p", { class: "mute" }, "No requests yet.")];
+  return list.slice().reverse().map(r => {
+    const b = r.blast_radius;
+    const buttons = [];
+    if (r.status === "pending" && ME.role !== "contractor") {
+      buttons.push(el("button", { class: "btn primary", onclick: () => act("/requests/" + r.id + "/decision", { approve: true }, "Approved.") }, "Approve"));
+      buttons.push(el("button", { class: "btn danger", onclick: () => act("/requests/" + r.id + "/decision", { approve: false, note: "denied from dashboard" }, "Denied.") }, "Deny"));
+    }
+    if (r.status === "approved" && ME.role === "contractor") {
+      buttons.push(el("button", { class: "btn primary", onclick: async () => {
+        const out = await act("/requests/" + r.id + "/claim", {}, "Credentials issued. Copy them now; they are shown once.");
+        if (out) $("view").prepend(el("div", { class: "card" }, el("strong", {}, "Temporary credentials (shown once)"), el("pre", {}, JSON.stringify(out.credentials, null, 2))));
+      } }, "Claim credentials"));
+    }
+    return el("div", { class: "card" },
+      el("div", { class: "row" }, el("strong", {}, r.id), el("span", { class: "tag" }, r.status), sevTag(b.risk + " risk"),
+        el("span", { class: "mute small" }, r.contractor + " · " + r.duration_minutes + " min · ticket " + r.ticket)),
+      el("div", {}, r.purpose),
+      el("div", { class: "small mute" }, "Services: " + b.services.join(", ")),
+      el("ul", { class: "small" }, b.reasons.map(x => el("li", {}, x))),
+      el("div", { class: "row" }, buttons));
+  });
+}
+async function grants() {
+  const list = await api("/grants");
+  if (!list.length) return [el("p", { class: "mute" }, "No grants yet.")];
+  return list.slice().reverse().map(g => el("div", { class: "card" },
+    el("div", { class: "row" }, el("strong", {}, g.id), el("span", { class: "tag" }, g.status),
+      el("span", { class: "mute small" }, g.contractor + " · expires " + g.expires_at + " · session " + g.session_name)),
+    ME.role !== "contractor" ? el("div", { class: "row" },
+      el("button", { class: "btn", onclick: async () => { const r = await act("/grants/" + g.id + "/review", {}, "Reviewed."); if (r) say(r.events_seen + " events seen, " + r.findings.length + " new finding(s).", true); } }, "Review activity"),
+      g.status === "active" ? el("button", { class: "btn danger", onclick: () => act("/grants/" + g.id + "/revoke", { reason: "revoked from dashboard" }, "Revoked.") }, "Revoke") : null) : null));
+}
+async function findings() {
+  const bar = el("div", { class: "row" }, el("button", { class: "btn primary", onclick: () => act("/scan/run", {}, "Scan finished.") }, "Run scan now"));
+  const list = await api("/findings");
+  const cards = list.slice().reverse().map(f => {
+    const detail = el("div");
+    return el("div", { class: "card" },
+      el("div", { class: "row" }, sevTag(f.severity), el("strong", {}, f.kind), el("span", { class: "tag" }, f.status), el("span", { class: "mute small" }, f.id)),
+      el("div", {}, f.summary),
+      el("div", { class: "row" }, el("button", { class: "btn", onclick: async () => {
+        const [full, ex] = await Promise.all([api("/findings/" + f.id), api("/findings/" + f.id + "/explanation")]);
+        detail.replaceChildren(
+          el("div", { class: "small" }, el("strong", {}, "Explanation (" + ex.source + ", confidence " + ex.confidence + "): "), ex.summary),
+          ex.ai_rejected_reason ? el("div", { class: "small bad" }, "AI answer rejected: " + ex.ai_rejected_reason) : null,
+          el("div", { class: "small" }, el("strong", {}, "Evidence:")),
+          ...full.evidence.slice(0, 12).map(e => el("pre", {}, e.id + " [" + e.source + "] " + JSON.stringify(e.event))));
+      } }, "Show evidence"), f.status === "open" ? el("button", { class: "btn", onclick: () => act("/findings/" + f.id + "/close", {}, "Closed.") }, "Close") : null), detail);
+  });
+  return [bar, ...(cards.length ? cards : [el("p", { class: "mute" }, "No findings. Run a scan.")])];
+}
+async function audit() {
+  const v = await api("/audit/verify");
+  const list = await api("/audit?limit=100");
+  return [el("div", { class: "card" }, el("strong", { class: v.ok ? "ok" : "bad" }, v.ok ? "Audit chain verified" : "AUDIT CHAIN BROKEN at entry " + v.first_bad_seq),
+      el("div", { class: "small mute" }, v.entries + " entries. Head: " + v.head + ". Save the head somewhere outside this system.")),
+    ...list.map(a => el("div", { class: "small row" }, el("span", { class: "mute" }, a.ts), el("strong", {}, a.action), el("span", {}, a.actor), el("span", { class: "mute" }, JSON.stringify(a.detail))))];
+}
+$("signin").addEventListener("click", signIn);
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") signIn(); });
+if (KEY) signIn();
+</script>
+</body>
+</html>
