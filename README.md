@@ -4,7 +4,7 @@
 
 This first release is the contractor-access module. Small companies give contractors and vendors cloud access, then forget to remove it. Plumbline ties every grant to a contract, expires it automatically, shows the approver what the access can reach, and later checks what the contractor actually did against what they asked for. Every finding links to the exact event behind it.
 
-> **Status: early (v0.2).** The core logic is tested (144 tests, CI on Python 3.11 to 3.13). Scope enforcement, the orphan scan, and revocation have all been exercised on a real AWS account. Nothing has been run against a live LLM, and the evaluation uses **simulated** data. See [What is and isn't tested](#what-is-and-isnt-tested) and [Not built yet](#not-built-yet) before relying on it.
+> **Status: early (v0.3).** The core logic is tested (173 tests, CI on Python 3.11 to 3.13). Scope enforcement, the orphan scan, and revocation have all been exercised on a real AWS account; nothing has been run against a live LLM, and the evaluation uses **simulated** data. The change-risk scorer and SLO starter kit (modules 2 and 3) are new and not yet used on a real deployment pipeline or real production traffic. See [What is and isn't tested](#what-is-and-isnt-tested) and [Not built yet](#not-built-yet) before relying on it.
 
 ## How it works
 
@@ -50,6 +50,8 @@ flowchart LR
 | Anomaly detection (M1.8) | Compares each session with that contractor's own earlier sessions on the same role: one session used from several addresses, volume or breadth far above their usual, new source addresses, new actions, unusual hours. Signals are weighted, and a finding needs a total of 3 (a new address alone is not enough). With at least 20 earlier sessions an optional Isolation Forest (scikit-learn) adds a second opinion. Every signal names the events behind it, and the baseline used is stored as evidence. |
 | Evidence-checked explanations | Findings cannot exist without stored evidence. An optional LLM explanation is rejected unless it cites evidence that belongs to that finding. |
 | Audit trail | Hash-chained log of every request, decision, grant, revoke and scan. |
+| Change-risk scorer (module 2) | Scores a proposed change from facts you give it — environment, services touched, whether requester and approver are different people, review count, rollback plan and whether it was tested, size, timing, and declared change freezes — as a sum of named, weighted signals. Every score comes with the reasons behind it. |
+| SLO starter kit (module 3) | Define a target (e.g. 99.9% over 30 days), record good/bad events, and get the error budget remaining plus a two-window burn-rate alert (the method from Google's SRE Workbook), so a budget that is burning too fast is flagged before it is gone. |
 | SOC 2 evidence report | `GET /reports/soc2?start=..&end=..` (JSON) and `/reports/soc2.pdf` map what Plumbline recorded to SOC 2 Security criteria CC6.1, CC6.2, CC6.3, CC7.2 and CC7.3, with counts, audit-log integrity and the head hash, open high and critical findings, and a section on what the report does not cover. It is evidence for an auditor, not a statement of compliance. Criterion wording is a paraphrase, not the AICPA text. |
 
 ## Try it with no AWS account (demo mode)
@@ -82,7 +84,7 @@ Optional LLM explanations: set `ANTHROPIC_API_KEY` (and optionally `PLUMBLINE_MO
 | LLM explainer | Against a **mock** HTTP transport only. Never called against the live API in this repo's tests |
 | Key rules | Mutation-checked once by hand: breaking the scope check, the contract-end cap, or separation of duties makes tests fail |
 | Detection quality | Simulated scenarios only (see below) |
-| Real AWS | Scope enforcement, orphan scan, and revocation all exercised on a personal AWS test account. Orphan role flagged with `NO_CONTRACT_TAG` (severity high). Revocation produced an explicit Deny on the same temporary credentials within seconds; `UNGRANTED_ACTIVITY` finding raised after re-scan. |
+| Real AWS | Scope enforcement, the orphan scan, and revocation were exercised on a personal AWS test account: a real credential issued by Plumbline stopped working immediately after revoke (AWS returned an explicit deny), and the orphan scan correctly flagged an untagged contractor role |
 
 ### Evaluation (simulated data)
 
@@ -106,14 +108,16 @@ Optional LLM explanations: set `ANTHROPIC_API_KEY` (and optionally `PLUMBLINE_MO
 - **The audit log is tamper-evident, not tamper-proof.** Someone who can rewrite the whole database can rebuild a valid chain, and removing the newest entries is only caught if you saved an earlier head hash elsewhere.
 - **Policies:** only `Allow` statements without `Condition`, `NotAction`, `NotResource` or `Principal` are accepted, because Plumbline does not evaluate those and will not pretend to. Scope checks use wildcard matching and fail closed.
 - **Baselines are only as good as the history.** Earlier sessions are assumed to be legitimate. A new contractor has no baseline, so only the multiple-address check works for them. The Isolation Forest needs at least 20 earlier sessions and is skipped if scikit-learn is not installed (`pip install -r requirements-ml.txt`).
-- **A finding, once open, is not updated with later evidence.** If the same role triggers a second scan before the first finding is resolved, Plumbline deduplicates by kind and role and keeps the original finding. Later evidence is stored but not attached to the existing finding.
+- **A finding, once open, is not updated with later evidence.** If a grant already has an open `OUT_OF_SCOPE_ATTEMPT` finding and a CloudTrail event for it arrives late (events can lag several minutes), that event is not added to the finding or reported separately, because dedup is keyed per grant, not per event. Confirmed in real-AWS testing.
+- **The change-risk scorer only knows what it is told.** `review_count`, `has_rollback_plan` and the rest are supplied by whoever submits the change; nothing here verifies them against your source control or CI. It is a consistent, explainable scoring rule, not a fraud check.
+- **The SLO burn-rate alert needs real traffic to mean anything.** The two-window thresholds are the published values for a 30-day window, scaled by window length; they have not been tuned against a real service's noise.
 - **IAM-user contractors** are found by the orphan scan, but activity from long-lived keys is not matched to grants.
 - **The stated purpose is free text.** The rules cannot judge it. The optional LLM explanation is asked to compare purpose and activity, and its answer is only trusted if its citations check out.
 
 ## Not built yet
 
-- The other modules (change-risk scorer, SLO kit).
-- Azure and GCP.
+- Azure and GCP support.
+- Linking a change (module 2) to the access and contractor flow (module 1) — today they are two separate, independently useful features in one codebase, not yet one guardrail pipeline.
 
 ## Development
 

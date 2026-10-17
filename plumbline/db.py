@@ -31,6 +31,21 @@ CREATE TABLE IF NOT EXISTS findings (
     grant_id TEXT, summary TEXT NOT NULL, evidence_ids TEXT NOT NULL, detail_json TEXT NOT NULL,
     dedupe_key TEXT, status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS changes (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL, environment TEXT NOT NULL, services_json TEXT NOT NULL,
+    requester TEXT NOT NULL, approver TEXT, scheduled_at TEXT NOT NULL,
+    lines_changed INTEGER NOT NULL, review_count INTEGER NOT NULL,
+    has_rollback_plan INTEGER NOT NULL, rollback_tested INTEGER NOT NULL,
+    score INTEGER NOT NULL, risk TEXT NOT NULL, signals_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'proposed', created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS slos (
+    id TEXT PRIMARY KEY, service TEXT NOT NULL, name TEXT NOT NULL,
+    target_percent REAL NOT NULL, window_days INTEGER NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS slo_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, slo_id TEXT NOT NULL, ts TEXT NOT NULL, good INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, actor TEXT NOT NULL,
     action TEXT NOT NULL, detail_json TEXT NOT NULL, prev_hash TEXT NOT NULL, hash TEXT NOT NULL

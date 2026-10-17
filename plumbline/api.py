@@ -15,6 +15,8 @@ from .access import AccessError, NotFound
 from .app_factory import Plumbline
 from .explain import verified_explanation
 from .policy import PolicyError
+from .change_risk import ChangeRiskService
+from .slo import SLOService
 from .soc2 import build_report, render_pdf
 
 STATIC = Path(__file__).parent / "static"
@@ -64,8 +66,37 @@ class RevokeIn(BaseModel):
     reason: str = Field(min_length=3)
 
 
+class ChangeIn(BaseModel):
+    title: str
+    environment: str
+    services: list[str]
+    requester: str
+    approver: str | None = None
+    scheduled_at: str
+    lines_changed: int = 0
+    review_count: int = 0
+    has_rollback_plan: bool = False
+    rollback_tested: bool = False
+
+
+class StatusIn(BaseModel):
+    status: str
+
+
+class SLOIn(BaseModel):
+    service: str
+    name: str
+    target_percent: float
+    window_days: int = 30
+
+
+class SLOEventIn(BaseModel):
+    good: bool
+    ts: str | None = None
+
+
 def create_app(pl: Plumbline, keys: dict[str, User]) -> FastAPI:
-    app = FastAPI(title="Plumbline", version="0.2.0")
+    app = FastAPI(title="Plumbline", version="0.3.0")
 
     @app.exception_handler(NotFound)
     async def _nf(_, e):
@@ -187,6 +218,65 @@ def create_app(pl: Plumbline, keys: dict[str, User]) -> FastAPI:
     @app.get("/audit/verify")
     def verify(u: User = Depends(reviewer)):
         return {**pl.audit.verify(), "head": pl.audit.head()}
+
+
+    # ---- module 2: change-risk scorer ----
+    @app.post("/changes", status_code=201)
+    def submit_change(body: ChangeIn, u: User = Depends(need("approver", "admin"))):
+        try:
+            return pl.changes.submit(u.name, body.title, body.environment, body.services,
+                                     body.requester, body.approver, body.scheduled_at,
+                                     body.lines_changed, body.review_count,
+                                     body.has_rollback_plan, body.rollback_tested)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+
+    @app.get("/changes")
+    def list_changes(risk: str | None = None, u: User = Depends(reviewer)):
+        return pl.changes.list(risk)
+
+    @app.get("/changes/{cid}")
+    def get_change(cid: str, u: User = Depends(reviewer)):
+        try:
+            return pl.changes.get(cid)
+        except KeyError as e:
+            raise NotFound(str(e)) from None
+
+    @app.post("/changes/{cid}/status")
+    def set_change_status(cid: str, body: StatusIn, u: User = Depends(reviewer)):
+        try:
+            return pl.changes.mark_status(u.name, cid, body.status)
+        except KeyError as e:
+            raise NotFound(str(e)) from None
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+
+    # ---- module 3: SLO starter kit ----
+    @app.post("/slos", status_code=201)
+    def define_slo(body: SLOIn, u: User = Depends(need("admin"))):
+        try:
+            return pl.slos.define(u.name, body.service, body.name, body.target_percent, body.window_days)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+
+    @app.get("/slos")
+    def list_slos(u: User = Depends(reviewer)):
+        return pl.slos.list()
+
+    @app.post("/slos/{sid}/events", status_code=201)
+    def record_slo_event(sid: str, body: SLOEventIn, u: User = Depends(reviewer)):
+        try:
+            pl.slos.record(sid, body.good, body.ts)
+        except KeyError as e:
+            raise NotFound(str(e)) from None
+        return {"recorded": True}
+
+    @app.get("/slos/{sid}/status")
+    def slo_status(sid: str, u: User = Depends(reviewer)):
+        try:
+            return pl.slos.status(sid)
+        except KeyError as e:
+            raise NotFound(str(e)) from None
 
     # ---- SOC 2 evidence report ----
     @app.get("/reports/soc2")

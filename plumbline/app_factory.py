@@ -4,12 +4,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .access import AccessService
+from .change_risk import ChangeRiskService
 from .analysis import Analyzer
 from .audit import AuditLog
 from .clock import utcnow
 from .db import Database
 from .evidence import EvidenceStore, FindingStore
 from .explain import Explainer, TemplateExplainer
+from .slo import SLOService
 
 
 @dataclass
@@ -22,14 +24,19 @@ class Plumbline:
     findings: FindingStore
     analyzer: Analyzer
     explainer: Explainer
+    changes: ChangeRiskService
+    slos: SLOService
 
 
 def build(gateway, db_path: str = ":memory:", clock=utcnow, explainer: Explainer | None = None,
-          max_duration_minutes: int = 480) -> Plumbline:
+          max_duration_minutes: int = 480, freeze_windows: list[tuple] | None = None) -> Plumbline:
     db = Database(db_path)
     audit = AuditLog(db)
     access = AccessService(db, gateway, audit, clock=clock, max_duration_minutes=max_duration_minutes)
     evidence = EvidenceStore(db)
     findings = FindingStore(db, evidence)
     analyzer = Analyzer(db, gateway, access, evidence, findings, audit, clock=clock)
-    return Plumbline(db, gateway, audit, access, evidence, findings, analyzer, explainer or TemplateExplainer())
+    changes = ChangeRiskService(db, audit, clock, freeze_windows=freeze_windows)
+    slos = SLOService(db, audit, clock)
+    return Plumbline(db, gateway, audit, access, evidence, findings, analyzer,
+                     explainer or TemplateExplainer(), changes, slos)
