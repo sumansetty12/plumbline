@@ -93,6 +93,16 @@ class Env:
                 ["arn:aws:s3:::data-bucket/obj"], error, ip)
         self.gw.events.append(e)
 
+    def history(self, sessions: int, ip="203.0.113.10", low=10, high=60):
+        """Earlier sessions for this contractor, 2+ days before the scenario, in working hours."""
+        for k in range(sessions):
+            day = 2 + k
+            sess = f"plb-hist{self.rng.randrange(10 ** 6)}-{k}"
+            start = T0 - timedelta(days=day) + timedelta(minutes=self.rng.randint(0, 120))
+            for i in range(self.rng.randint(low, high)):
+                self.gw.events.append(_ev(self.eid(), start + timedelta(minutes=i % 90), sess, self.role,
+                                          self.rng.choice(READ_ACTIONS[:3]), ["arn:aws:s3:::data-bucket/obj"], None, ip))
+
     def principal(self, name, contract_id, created="2025-01-01T00:00:00Z", last_used="2026-02-01T00:00:00Z"):
         self.gw.principals.append({"name": name, "arn": f"arn:aws:iam::1:role/{name}", "kind": "role",
                                    "contract_id": contract_id, "created": created, "last_used": last_used})
@@ -216,13 +226,82 @@ def over_broad_request(rng):
     return Result(set())
 
 
-# ---------- known-hard: the rules do not claim to catch these ----------
-def slow_exfiltration_within_scope(rng):
+# ---------- anomaly detection (M1.8): designed-for, with a baseline ----------
+def benign_with_history(rng):
     env = Env(rng)
+    env.history(rng.randint(6, 30))
+    acts = rng.sample(READ_ACTIONS[:3], rng.randint(1, 3))
+    g = env.issue(acts)
+    for i in range(rng.randint(10, 70)):
+        env.event(g, 1 + i % 90, rng.choice(acts))
+    return env.finish()
+
+
+def benign_busier_day(rng):
+    env = Env(rng)
+    env.history(rng.randint(6, 30), low=20, high=40)
+    g = env.issue(READ_ACTIONS[:3])
+    for i in range(rng.randint(70, 85)):   # about 2.5x the usual, short of a spike
+        env.event(g, 1 + i % 100, rng.choice(READ_ACTIONS[:3]))
+    return env.finish()
+
+
+def benign_new_ip_only(rng):
+    env = Env(rng)
+    env.history(rng.randint(6, 30))
+    g = env.issue(READ_ACTIONS[:3])
+    for i in range(rng.randint(10, 50)):
+        env.event(g, 1 + i % 90, rng.choice(READ_ACTIONS[:3]), ip="192.0.2.55")  # works from home today
+    return env.finish()
+
+
+def volume_spike_vs_baseline(rng):
+    env = Env(rng)
+    env.history(rng.randint(6, 30), low=10, high=40)
+    g = env.issue(["s3:GetObject", "s3:ListBucket"], minutes=240)
+    for i in range(rng.randint(250, 500)):
+        env.event(g, 1 + i // 3, rng.choice(["s3:GetObject", "s3:ListBucket"]))
+    return env.finish(hours=5)
+
+
+def credentials_used_from_two_places(rng):
+    env = Env(rng)
+    if rng.random() < 0.5:
+        env.history(rng.randint(6, 12))
+    g = env.issue(["s3:GetObject"])
+    for i in range(rng.randint(3, 10)):
+        env.event(g, 1 + i, "s3:GetObject", ip="203.0.113.10")
+    for i in range(rng.randint(3, 10)):
+        env.event(g, 20 + i, "s3:GetObject", ip="198.51.100.200")
+    return env.finish()
+
+
+def new_ip_and_new_actions_and_odd_hour(rng):
+    env = Env(rng)
+    env.history(rng.randint(6, 30))
+    env.clock.advance(hours=15)   # scenario starts at 00:00 UTC, far from the usual 09:00-11:00
+    g = env.issue(["s3:GetObject", "s3:ListBucket", "logs:GetLogEvents"])
+    for i in range(rng.randint(10, 40)):
+        env.event(g, 1 + i, rng.choice(["s3:ListBucket", "logs:GetLogEvents"]), ip="198.51.100.9")
+    return env.finish()
+
+
+# ---------- known-hard: the rules do not claim to catch these ----------
+def exfiltration_without_baseline(rng):
+    env = Env(rng)     # a brand-new contractor: nothing to compare against
     g = env.issue(["s3:GetObject", "s3:ListBucket"], minutes=240)
     for i in range(rng.randint(150, 300)):
         env.event(g, 1 + i // 2, "s3:GetObject")
     return env.finish(hours=5)
+
+
+def low_and_slow_inside_baseline(rng):
+    env = Env(rng)
+    env.history(rng.randint(6, 30), low=20, high=40)
+    g = env.issue(["s3:GetObject"])
+    for i in range(rng.randint(25, 38)):   # looks exactly like a normal day
+        env.event(g, 1 + i % 90, "s3:GetObject")
+    return env.finish()
 
 
 def reads_unrelated_to_purpose(rng):
@@ -230,16 +309,6 @@ def reads_unrelated_to_purpose(rng):
     g = env.issue(["s3:GetObject"])
     for i in range(rng.randint(5, 30)):
         env.event(g, 1 + i, "s3:GetObject")   # purpose said "export failures"; reads HR data in scope
-    return env.finish()
-
-
-def credentials_used_from_two_places(rng):
-    env = Env(rng)
-    g = env.issue(["s3:GetObject"])
-    for i in range(rng.randint(3, 10)):
-        env.event(g, 1 + i, "s3:GetObject", ip="203.0.113.10")
-    for i in range(rng.randint(3, 10)):
-        env.event(g, 20 + i, "s3:GetObject", ip="198.51.100.200")
     return env.finish()
 
 
@@ -261,7 +330,13 @@ SCENARIOS = [
     S("unknown_contract", "designed", True, ["UNKNOWN_CONTRACT"], [], unknown_contract),
     S("dormant_principal", "designed", True, ["DORMANT"], [], dormant_principal),
     S("over_broad_request", "designed", True, ["REQUEST_REFUSED"], [], over_broad_request),
-    S("slow_exfiltration_within_scope", "known-hard", True, [], [], slow_exfiltration_within_scope),
+    S("volume_spike_vs_baseline", "designed", True, ["ANOMALOUS_SESSION"], [], volume_spike_vs_baseline),
+    S("credentials_used_from_two_places", "designed", True, ["ANOMALOUS_SESSION"], [], credentials_used_from_two_places),
+    S("new_ip_and_new_actions_and_odd_hour", "designed", True, ["ANOMALOUS_SESSION"], [], new_ip_and_new_actions_and_odd_hour),
+    S("benign_with_history", "benign", False, [], [], benign_with_history),
+    S("benign_busier_day", "benign", False, [], [], benign_busier_day),
+    S("benign_new_ip_only", "benign", False, [], [], benign_new_ip_only),
+    S("exfiltration_without_baseline", "known-hard", True, [], [], exfiltration_without_baseline),
+    S("low_and_slow_inside_baseline", "known-hard", True, [], [], low_and_slow_inside_baseline),
     S("reads_unrelated_to_purpose", "known-hard", True, [], [], reads_unrelated_to_purpose),
-    S("credentials_used_from_two_places", "known-hard", True, [], [], credentials_used_from_two_places),
 ]

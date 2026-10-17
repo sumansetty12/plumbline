@@ -227,3 +227,68 @@ def test_dashboard_never_passes_null_to_replacechildren():
     html = (Path(__file__).resolve().parent.parent / "plumbline" / "static" / "dashboard.html").read_text()
     # the explanation panel builds its children as a list and filters out empty entries
     assert ".filter(Boolean)" in html
+
+
+# ---------- M1.8 anomaly findings ----------
+def _history(gw, clock, days=8, per=20):
+    """Earlier sessions on the contract role, in working hours from one address."""
+    for k in range(days):
+        start = clock() - timedelta(days=2 + k)
+        for i in range(per):
+            gw.events.append(make_event(f"h{k}-{i}", start + timedelta(minutes=i), f"plb-old{k}", "s3:GetObject",
+                                        ["arn:aws:s3:::acme-data/a"]))
+
+
+def test_unusual_session_gets_anomaly_finding_with_baseline_evidence(pl, gw, contract, clock):
+    _history(gw, clock)
+    g = issue(pl, contract, minutes=120)
+    t = clock()
+    for i in range(300):
+        gw.events.append(make_event(f"n{i}", t + timedelta(minutes=1 + i // 5), g["session_name"], "s3:GetObject",
+                                    ["arn:aws:s3:::acme-data/a"]))
+    clock.advance(minutes=130)
+    res = pl.analyzer.review_grant(g["id"])
+    f = [x for x in res["findings"] if x["kind"] == "ANOMALOUS_SESSION"][0]
+    assert "VOLUME_SPIKE" in f["detail"]["signals"]
+    ev = pl.evidence.get_many(f["evidence_ids"])
+    assert any(e["source"] == "baseline" for e in ev)
+    assert all(pl.evidence.exists(i) for i in f["evidence_ids"])
+    again = pl.analyzer.review_grant(g["id"])
+    assert [x for x in again["findings"] if x["kind"] == "ANOMALOUS_SESSION"] == []   # deduplicated
+
+
+def test_normal_session_with_history_is_quiet(pl, gw, contract, clock):
+    _history(gw, clock)
+    g = issue(pl, contract, minutes=120)
+    t = clock()
+    for i in range(20):
+        gw.events.append(make_event(f"n{i}", t + timedelta(minutes=1 + i), g["session_name"], "s3:GetObject",
+                                    ["arn:aws:s3:::acme-data/a"]))
+    clock.advance(minutes=130)
+    assert "ANOMALOUS_SESSION" not in kinds(pl.analyzer.review_grant(g["id"])["findings"])
+
+
+def test_failed_baseline_lookup_does_not_hide_other_findings(pl, gw, contract, clock, monkeypatch):
+    g = issue(pl, contract)
+    gw.events.append(make_event("e1", clock() + timedelta(minutes=1), g["session_name"], "iam:CreateAccessKey", error="AccessDenied"))
+    clock.advance(minutes=10)
+
+    def boom(self, *a, **k):
+        raise RuntimeError("cloudtrail throttled")
+    monkeypatch.setattr(type(pl.analyzer), "_anomaly_finding", boom)
+    res = pl.analyzer.review_grant(g["id"])
+    assert "OUT_OF_SCOPE_ATTEMPT" in kinds(res["findings"])
+    entry = [e for e in pl.audit.entries() if e["action"] == "review.grant"][-1]
+    assert "skipped" in entry["detail"]["anomaly_check"]
+
+
+def test_anomaly_check_can_be_switched_off(pl, gw, contract, clock):
+    pl.analyzer.anomaly_enabled = False
+    _history(gw, clock)
+    g = issue(pl, contract, minutes=120)
+    t = clock()
+    for i in range(300):
+        gw.events.append(make_event(f"n{i}", t + timedelta(minutes=1 + i // 5), g["session_name"], "s3:GetObject",
+                                    ["arn:aws:s3:::acme-data/a"]))
+    clock.advance(minutes=130)
+    assert "ANOMALOUS_SESSION" not in kinds(pl.analyzer.review_grant(g["id"])["findings"])

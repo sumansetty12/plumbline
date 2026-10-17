@@ -8,13 +8,14 @@ from datetime import timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from .access import AccessError, NotFound
 from .app_factory import Plumbline
 from .explain import verified_explanation
 from .policy import PolicyError
+from .soc2 import build_report, render_pdf
 
 STATIC = Path(__file__).parent / "static"
 
@@ -64,7 +65,7 @@ class RevokeIn(BaseModel):
 
 
 def create_app(pl: Plumbline, keys: dict[str, User]) -> FastAPI:
-    app = FastAPI(title="Plumbline", version="0.1.0")
+    app = FastAPI(title="Plumbline", version="0.2.0")
 
     @app.exception_handler(NotFound)
     async def _nf(_, e):
@@ -187,7 +188,28 @@ def create_app(pl: Plumbline, keys: dict[str, User]) -> FastAPI:
     def verify(u: User = Depends(reviewer)):
         return {**pl.audit.verify(), "head": pl.audit.head()}
 
+    # ---- SOC 2 evidence report ----
+    @app.get("/reports/soc2")
+    def soc2_json(start: str, end: str, u: User = Depends(reviewer)):
+        return build_report(pl, _ts(start), _ts(end))
+
+    @app.get("/reports/soc2.pdf")
+    def soc2_pdf(start: str, end: str, u: User = Depends(reviewer)):
+        pdf = render_pdf(build_report(pl, _ts(start), _ts(end)))
+        pl.audit.append(u.name, "report.soc2", {"start": start, "end": end}, _now(pl))
+        return Response(pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": 'attachment; filename="plumbline-soc2-report.pdf"'})
+
     return app
+
+
+def _ts(value: str) -> str:
+    from .clock import parse
+    try:
+        parse(value)
+    except ValueError:
+        raise HTTPException(422, f"not a valid ISO timestamp: {value!r}") from None
+    return value
 
 
 def _now(pl: Plumbline) -> str:

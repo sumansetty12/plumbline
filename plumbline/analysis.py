@@ -1,12 +1,13 @@
-"""Checks that turn raw cloud activity into findings (features M1.4, M1.6, M1.7).
+"""Checks that turn raw cloud activity into findings (features M1.4, M1.6, M1.7, M1.8).
 
-All rules here are deterministic. Every finding stores the ids of the events behind it.
+All rules here are deterministic, except the optional Isolation Forest second opinion inside the anomaly check (fixed seed). Every finding stores the ids of the events behind it.
 """
 from __future__ import annotations
 
 import threading
 from datetime import timedelta
 
+from . import anomaly as anom
 from . import policy as pol
 from .access import AccessService
 from .audit import AuditLog
@@ -25,7 +26,9 @@ def is_denied(error: str | None) -> bool:
 
 class Analyzer:
     def __init__(self, db: Database, gateway, access: AccessService, evidence: EvidenceStore,
-                 findings: FindingStore, audit: AuditLog, clock=utcnow):
+                 findings: FindingStore, audit: AuditLog, clock=utcnow,
+                 anomaly_enabled: bool = True, anomaly_lookback_days: int = 30):
+        self.anomaly_enabled, self.anomaly_lookback = anomaly_enabled, timedelta(days=anomaly_lookback_days)
         self.db, self.gw, self.access = db, gateway, access
         self.evidence, self.findings, self.audit, self.clock = evidence, findings, audit, clock
         self._lock = threading.RLock()  # one scan or review at a time (a double-click must not race)
@@ -118,6 +121,15 @@ class Analyzer:
             if f:
                 created.append(f)
 
+        anomaly_note = None
+        if self.anomaly_enabled and events:
+            try:
+                f = self._anomaly_finding(g, events, ev_ids, grant_ev, base)
+                if f:
+                    created.append(f)
+            except Exception as e:  # a failed baseline lookup must not hide the rest of the review
+                anomaly_note = f"skipped: {type(e).__name__}"
+
         used = [{"action": e["action"], "resources": e["resources"]} for e in ok_events]
         rs = pol.right_size(g["policy"], used)
         finished = g["status"] != "active" or parse(g["expires_at"]) <= now
@@ -130,8 +142,35 @@ class Analyzer:
             if f:
                 created.append(f)
         self.audit.append(actor, "review.grant", {"grant_id": grant_id, "events": len(events),
-                                                  "findings": len(created)}, iso(self.clock()))
+                                                  "findings": len(created),
+                                                  "anomaly_check": anomaly_note or "ran"}, iso(self.clock()))
         return {"grant_id": grant_id, "events_seen": len(events), "findings": created, "right_sizing": rs}
+
+    # ---------- M1.8: unusual for this contractor ----------
+    def _anomaly_finding(self, g, events, ev_ids, grant_ev, base):
+        role = self.access.role_name(g["role_arn"])
+        issued = parse(g["issued_at"])
+        past = [e for e in self.gw.lookup_events(issued - self.anomaly_lookback, issued - timedelta(seconds=1))
+                if e.get("role") == role and e["principal"] != g["session_name"]]
+        result = anom.detect(events, anom.group_sessions(past))
+        if not result:
+            return None
+        base_ev = self.evidence.add("baseline", {"id": f"baseline:{g['id']}", "time": g["issued_at"],
+                                                 "contract_role": role, "window_days": self.anomaly_lookback.days,
+                                                 "session_features": result["features"], **result["baseline"]})
+        ids = [grant_ev, base_ev]
+        for sgn in result["signals"]:
+            ids += [ev_ids[i] for i in sgn.event_ids if i in ev_ids]
+        ids = list(dict.fromkeys(ids))
+        names = ", ".join(sgn.name for sgn in result["signals"])
+        return self._add(kind="ANOMALOUS_SESSION", severity=result["severity"], contractor=g["contractor"],
+                         grant_id=g["id"],
+                         summary=(f"{g['contractor']}'s session looks unusual compared with their own earlier sessions "
+                                  f"(score {result['score']}): " + " ".join(sgn.text for sgn in result["signals"])),
+                         evidence_ids=ids,
+                         detail={**base, "score": result["score"], "signals": names,
+                                 "baseline": result["baseline"]},
+                         dedupe_key=f"anomaly:{g['id']}")
 
     # ---------- activity with no matching grant ----------
     def scan_ungranted_activity(self, since, until, actor: str = "system") -> list[dict]:

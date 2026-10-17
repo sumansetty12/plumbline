@@ -4,7 +4,7 @@
 
 This first release is the contractor-access module. Small companies give contractors and vendors cloud access, then forget to remove it. Plumbline ties every grant to a contract, expires it automatically, shows the approver what the access can reach, and later checks what the contractor actually did against what they asked for. Every finding links to the exact event behind it.
 
-> **Status: early (v0.1).** The core logic is tested (116 tests, CI on Python 3.11 to 3.13). It has **not** been run against a real AWS account or a live LLM, and the evaluation uses **simulated** data. See [What is and isn't tested](#what-is-and-isnt-tested) and [Not built yet](#not-built-yet) before relying on it.
+> **Status: early (v0.2).** The core logic is tested (144 tests, CI on Python 3.11 to 3.13). Scope enforcement and findings have been exercised on a real AWS account; the orphan scan and revocation flows have not yet been run against real AWS, nothing has been run against a live LLM, and the evaluation uses **simulated** data. See [What is and isn't tested](#what-is-and-isnt-tested) and [Not built yet](#not-built-yet) before relying on it.
 
 ## How it works
 
@@ -21,9 +21,11 @@ flowchart LR
     T --> V[Review: declared vs actual]
     I[(IAM principals)] --> O[Orphan scan]
     T --> U[Ungranted-activity scan]
+    T --> N[Anomaly check vs the contractor's own history]
     V --> F[Findings with evidence ids]
     O --> F
     U --> F
+    N --> F
     F --> E[Explanation: rules first, optional LLM, citations checked]
     R -.-> L[(Hash-chained audit log)]
     A -.-> L
@@ -45,8 +47,10 @@ flowchart LR
 | Orphan scan | Finds contractor principals with no contract, an unknown contract, an ended contract, or no use for 90 days. |
 | Declared vs actual | Flags refused calls outside scope, sensitive calls that were allowed, and unused permissions, with a tighter suggested policy. |
 | Ungranted-activity scan | Flags activity on a contract role that no grant covers (credentials used outside Plumbline, or after expiry or revocation). |
+| Anomaly detection (M1.8) | Compares each session with that contractor's own earlier sessions on the same role: one session used from several addresses, volume or breadth far above their usual, new source addresses, new actions, unusual hours. Signals are weighted, and a finding needs a total of 3 (a new address alone is not enough). With at least 20 earlier sessions an optional Isolation Forest (scikit-learn) adds a second opinion. Every signal names the events behind it, and the baseline used is stored as evidence. |
 | Evidence-checked explanations | Findings cannot exist without stored evidence. An optional LLM explanation is rejected unless it cites evidence that belongs to that finding. |
 | Audit trail | Hash-chained log of every request, decision, grant, revoke and scan. |
+| SOC 2 evidence report | `GET /reports/soc2?start=..&end=..` (JSON) and `/reports/soc2.pdf` map what Plumbline recorded to SOC 2 Security criteria CC6.1, CC6.2, CC6.3, CC7.2 and CC7.3, with counts, audit-log integrity and the head hash, open high and critical findings, and a section on what the report does not cover. It is evidence for an auditor, not a statement of compliance. Criterion wording is a paraphrase, not the AICPA text. |
 
 ## Try it with no AWS account (demo mode)
 
@@ -73,24 +77,25 @@ Optional LLM explanations: set `ANTHROPIC_API_KEY` (and optionally `PLUMBLINE_MO
 
 | Area | How it is tested |
 |---|---|
-| Policy engine, access flow, analysis, evidence rules, audit chain, API roles | Unit and integration tests (116) |
+| Policy engine, access flow, analysis, evidence rules, audit chain, API roles | Unit and integration tests (144) |
 | Real `Boto3Gateway` | Against [moto](https://github.com/getmoto/moto) for STS and IAM, and a botocore Stubber for CloudTrail (including pagination) |
 | LLM explainer | Against a **mock** HTTP transport only. Never called against the live API in this repo's tests |
 | Key rules | Mutation-checked once by hand: breaking the scope check, the contract-end cap, or separation of duties makes tests fail |
 | Detection quality | Simulated scenarios only (see below) |
-| Real AWS | **Not tested.** No live account was used |
+| Real AWS | Partly. Scope enforcement and findings were exercised on a personal AWS test account. Orphan scan and revocation on real AWS are not yet tested |
 
 ### Evaluation (simulated data)
 
-`python -m eval.run_eval --seed 7 --per-scenario 12` runs 192 simulated scenarios and writes [eval/RESULTS.md](eval/RESULTS.md).
+`python -m eval.run_eval --seed 7 --per-scenario 12` runs 264 simulated scenarios and writes [eval/RESULTS.md](eval/RESULTS.md).
 
 | Measure | Result |
 |---|---|
 | False alarms on benign scenarios | 0.0% |
 | Designed-for scenarios handled as expected | 100.0% |
 | Known-hard harmful scenarios that raised any alert | 0.0% |
+| All harmful scenarios that raised any alert | 81.2% |
 
-**How to read this honestly:** the scenarios were written by the people who wrote the rules, so the 100% shows the code does what it was designed to do and guards against regressions. It says nothing about how well Plumbline would do against real attackers. The known-hard cases (slow data theft within allowed access, reads unrelated to the stated purpose, one session used from two IP addresses) are caught by **none** of the current rules, and the results say so.
+**How to read this honestly:** the scenarios were written by the people who wrote the rules, so the 100% shows the code does what it was designed to do and guards against regressions. It says nothing about how well Plumbline would do against real attackers. The first version of the anomaly detector raised false alarms on 11% of benign scenarios (a busy day and a contractor working from a new address); the Isolation Forest was too eager and the volume threshold too low, and both were corrected. The thresholds were therefore adjusted with these scenarios in view. Three harmful cases are caught by **none** of the current checks, and the results say so: exfiltration by a brand-new contractor with no history to compare against, an attacker who behaves exactly like the contractor's normal day, and allowed reads that do not match the stated purpose.
 
 ## Limitations to know about
 
@@ -100,13 +105,12 @@ Optional LLM explanations: set `ANTHROPIC_API_KEY` (and optionally `PLUMBLINE_MO
 - **CloudTrail `LookupEvents`** covers management events from the last 90 days only, is rate limited, and events can arrive several minutes late. Run reviews some time after a session ends. Data events (for example S3 object reads) are only visible if you have enabled them in CloudTrail.
 - **The audit log is tamper-evident, not tamper-proof.** Someone who can rewrite the whole database can rebuild a valid chain, and removing the newest entries is only caught if you saved an earlier head hash elsewhere.
 - **Policies:** only `Allow` statements without `Condition`, `NotAction`, `NotResource` or `Principal` are accepted, because Plumbline does not evaluate those and will not pretend to. Scope checks use wildcard matching and fail closed.
+- **Baselines are only as good as the history.** Earlier sessions are assumed to be legitimate. A new contractor has no baseline, so only the multiple-address check works for them. The Isolation Forest needs at least 20 earlier sessions and is skipped if scikit-learn is not installed (`pip install -r requirements-ml.txt`).
 - **IAM-user contractors** are found by the orphan scan, but activity from long-lived keys is not matched to grants.
 - **The stated purpose is free text.** The rules cannot judge it. The optional LLM explanation is asked to compare purpose and activity, and its answer is only trusted if its citations check out.
 
 ## Not built yet
 
-- Anomaly detection per contractor (feature M1.8). The evaluation shows the gap it is meant to fill.
-- SOC 2 control mapping and PDF reports.
 - The other modules (change-risk scorer, SLO kit).
 - Azure and GCP.
 
