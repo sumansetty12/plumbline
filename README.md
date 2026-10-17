@@ -4,7 +4,7 @@
 
 This first release is the contractor-access module. Small companies give contractors and vendors cloud access, then forget to remove it. Plumbline ties every grant to a contract, expires it automatically, shows the approver what the access can reach, and later checks what the contractor actually did against what they asked for. Every finding links to the exact event behind it.
 
-> **Status: early (v0.2).** The core logic is tested (144 tests, CI on Python 3.11 to 3.13). Scope enforcement and findings have been exercised on a real AWS account; the orphan scan and revocation flows have not yet been run against real AWS, nothing has been run against a live LLM, and the evaluation uses **simulated** data. See [What is and isn't tested](#what-is-and-isnt-tested) and [Not built yet](#not-built-yet) before relying on it.
+> **Status: early (v0.2).** The core logic is tested (144 tests, CI on Python 3.11 to 3.13). Scope enforcement, the orphan scan, and revocation have all been exercised on a real AWS account. Nothing has been run against a live LLM, and the evaluation uses **simulated** data. See [What is and isn't tested](#what-is-and-isnt-tested) and [Not built yet](#not-built-yet) before relying on it.
 
 ## How it works
 
@@ -82,7 +82,7 @@ Optional LLM explanations: set `ANTHROPIC_API_KEY` (and optionally `PLUMBLINE_MO
 | LLM explainer | Against a **mock** HTTP transport only. Never called against the live API in this repo's tests |
 | Key rules | Mutation-checked once by hand: breaking the scope check, the contract-end cap, or separation of duties makes tests fail |
 | Detection quality | Simulated scenarios only (see below) |
-| Real AWS | Partly. Scope enforcement and findings were exercised on a personal AWS test account. Orphan scan and revocation on real AWS are not yet tested |
+| Real AWS | Scope enforcement, orphan scan, and revocation all exercised on a personal AWS test account. Orphan role flagged with `NO_CONTRACT_TAG` (severity high). Revocation produced an explicit Deny on the same temporary credentials within seconds; `UNGRANTED_ACTIVITY` finding raised after re-scan. |
 
 ### Evaluation (simulated data)
 
@@ -106,6 +106,7 @@ Optional LLM explanations: set `ANTHROPIC_API_KEY` (and optionally `PLUMBLINE_MO
 - **The audit log is tamper-evident, not tamper-proof.** Someone who can rewrite the whole database can rebuild a valid chain, and removing the newest entries is only caught if you saved an earlier head hash elsewhere.
 - **Policies:** only `Allow` statements without `Condition`, `NotAction`, `NotResource` or `Principal` are accepted, because Plumbline does not evaluate those and will not pretend to. Scope checks use wildcard matching and fail closed.
 - **Baselines are only as good as the history.** Earlier sessions are assumed to be legitimate. A new contractor has no baseline, so only the multiple-address check works for them. The Isolation Forest needs at least 20 earlier sessions and is skipped if scikit-learn is not installed (`pip install -r requirements-ml.txt`).
+- **A finding, once open, is not updated with later evidence.** If the same role triggers a second scan before the first finding is resolved, Plumbline deduplicates by kind and role and keeps the original finding. Later evidence is stored but not attached to the existing finding.
 - **IAM-user contractors** are found by the orphan scan, but activity from long-lived keys is not matched to grants.
 - **The stated purpose is free text.** The rules cannot judge it. The optional LLM explanation is asked to compare purpose and activity, and its answer is only trusted if its citations check out.
 
