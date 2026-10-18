@@ -110,3 +110,84 @@ def test_right_size_never_broader_than_request():
 def test_right_size_with_no_usage_suggests_nothing():
     r = p.right_size(stmts(["s3:GetObject"]), [])
     assert r["suggested_policy"] is None
+
+
+# ---------- multi-cloud: action syntax, classification, per-provider blast radius ----------
+
+def azure_stmts(actions, resources="/subscriptions/1/resourceGroups/rg"):
+    return p.normalize({"Statement": [{"Effect": "Allow", "Action": actions, "Resource": resources}]}, "azure")
+
+
+def gcp_stmts(actions, resources="projects/my-project/buckets/acme-data"):
+    return p.normalize({"Statement": [{"Effect": "Allow", "Action": actions, "Resource": resources}]}, "gcp")
+
+
+def test_normalize_accepts_well_formed_azure_and_gcp_actions():
+    assert azure_stmts(["Microsoft.Storage/storageAccounts/blobServices/containers/read"])
+    assert gcp_stmts(["storage.objects.get", "storage.objects.list"])
+
+
+def test_normalize_rejects_aws_style_action_for_other_providers():
+    with pytest.raises(p.PolicyError):
+        azure_stmts(["s3:GetObject"])
+    with pytest.raises(p.PolicyError):
+        gcp_stmts(["s3:GetObject"])
+
+
+def test_normalize_rejects_malformed_provider_actions():
+    with pytest.raises(p.PolicyError):
+        azure_stmts(["not an action"])
+    with pytest.raises(p.PolicyError):
+        gcp_stmts(["NotLowerCaseStart"])
+
+
+@pytest.mark.parametrize("action,expected", [
+    ("Microsoft.Storage/storageAccounts/blobServices/containers/read", "read"),
+    ("Microsoft.Storage/storageAccounts/write", "write"),
+    ("Microsoft.Storage/storageAccounts/delete", "destructive"),
+    ("Microsoft.Authorization/roleAssignments/write", "privilege"),
+    ("Microsoft.Authorization/roleAssignments/read", "read"),
+    ("*", "admin"),
+])
+def test_classify_action_azure(action, expected):
+    assert p.classify_action(action, "azure") == expected
+
+
+@pytest.mark.parametrize("action,expected", [
+    ("storage.objects.get", "read"),
+    ("storage.objects.list", "read"),
+    ("storage.objects.create", "write"),
+    ("storage.objects.delete", "destructive"),
+    ("storage.buckets.setIamPolicy", "privilege"),
+    ("iam.serviceAccounts.actAs", "privilege"),
+    ("secretmanager.versions.access", "secret-read"),
+    ("*", "admin"),
+])
+def test_classify_action_gcp(action, expected):
+    assert p.classify_action(action, "gcp") == expected
+
+
+def test_blast_radius_azure_privilege_and_destructive():
+    low = p.blast_radius(azure_stmts(["Microsoft.Storage/storageAccounts/blobServices/containers/read"]), "azure")
+    assert low["risk"] == "low"
+    crit = p.blast_radius(azure_stmts(["Microsoft.Authorization/roleAssignments/write"]), "azure")
+    assert crit["risk"] == "critical"
+
+
+def test_blast_radius_gcp_privilege_and_destructive():
+    low = p.blast_radius(gcp_stmts(["storage.objects.get"]), "gcp")
+    assert low["risk"] == "low"
+    crit = p.blast_radius(gcp_stmts(["storage.buckets.setIamPolicy"]), "gcp")
+    assert crit["risk"] == "critical"
+    high = p.blast_radius(gcp_stmts(["storage.objects.delete"]), "gcp")
+    assert high["risk"] == "high"
+
+
+def test_session_policy_json_size_limit_is_aws_only():
+    huge = stmts(["s3:GetObject"], [f"arn:aws:s3:::bucket-{i}" for i in range(400)])
+    with pytest.raises(p.PolicyError):
+        p.session_policy_json(huge, "aws")
+    azure_huge = azure_stmts(["Microsoft.Storage/storageAccounts/blobServices/containers/read"] * 1,
+                             resources=[f"/subscriptions/1/resourceGroups/rg-{i}" for i in range(400)])
+    text = p.session_policy_json(azure_huge, "azure")  # no AWS-sized ceiling applies
+    assert len(text) > 2048

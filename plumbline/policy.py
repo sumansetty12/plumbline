@@ -1,20 +1,50 @@
 """Pure functions over IAM-style policy documents: validation, scope checks, blast radius,
-and right-sizing. No AWS calls and no AI here: this is the deterministic rules tier."""
+and right-sizing. No cloud calls and no AI here: this is the deterministic rules tier.
+
+The document shape (Statement / Effect / Action / Resource) is AWS IAM's, kept as-is for
+all three providers because it is a fine, general way to write "these actions, on these
+resources" and there is no reason to invent a second syntax just to look provider-neutral.
+What differs per provider is the *action string* format, so `normalize` and
+`classify_action` both take a `provider` argument that changes how an action string is
+validated and split into (service, verb):
+
+* aws   - "service:Action", e.g. "s3:GetObject" (colon-separated)
+* azure - "Provider.Namespace/resourceType/action", e.g. "Microsoft.Storage/storageAccounts/read"
+* gcp   - "service.resource.verb", e.g. "storage.objects.get" (dot-separated)
+"""
 from __future__ import annotations
 
 import json
+import re
 from fnmatch import fnmatchcase
 
 MAX_SESSION_POLICY_CHARS = 2048  # AWS limit for an inline session policy
+
+_AZURE_ACTION_RE = re.compile(r"^[A-Za-z0-9]+(\.[A-Za-z0-9]+)*/[A-Za-z0-9*]+(/[A-Za-z0-9*]+)*$")
+_GCP_ACTION_RE = re.compile(r"^[a-z][a-zA-Z0-9]*(\.[a-zA-Z0-9*]+){1,}$")
 
 
 class PolicyError(ValueError):
     """The policy is malformed or uses constructs Plumbline refuses to reason about."""
 
 
+def _valid_action(a: str, provider: str) -> bool:
+    if not isinstance(a, str) or not a:
+        return False
+    if a == "*":
+        return True
+    if provider == "aws":
+        return ":" in a
+    if provider == "azure":
+        return bool(_AZURE_ACTION_RE.match(a))
+    if provider == "gcp":
+        return bool(_GCP_ACTION_RE.match(a))
+    raise PolicyError(f"unknown provider {provider!r}")
+
+
 # ---------- normalisation ----------
 
-def normalize(doc: dict | str) -> list[dict]:
+def normalize(doc: dict | str, provider: str = "aws") -> list[dict]:
     """Return [{'actions': [...], 'resources': [...]}] from an Allow-only policy document.
 
     Refuses Deny, NotAction, NotResource and Principal so a request can never hide
@@ -50,8 +80,8 @@ def normalize(doc: dict | str) -> list[dict]:
         if not actions or not resources:
             raise PolicyError("Action and Resource must not be empty")
         for a in actions:
-            if not isinstance(a, str) or (a != "*" and ":" not in a):
-                raise PolicyError(f"bad action: {a!r}")
+            if not _valid_action(a, provider):
+                raise PolicyError(f"bad action for provider={provider!r}: {a!r}")
         for r in resources:
             if not isinstance(r, str) or not r:
                 raise PolicyError(f"bad resource: {r!r}")
@@ -69,9 +99,15 @@ def to_document(statements: list[dict]) -> dict:
     }
 
 
-def session_policy_json(statements: list[dict]) -> str:
+def session_policy_json(statements: list[dict], provider: str = "aws") -> str:
+    """Serialize the requested scope. For AWS this is a real inline STS session policy and
+    is also checked against AWS's 2048-character limit. Azure and GCP have no equivalent of
+    an inline, per-call session policy that narrows an already-granted role below its own
+    permissions (see access.AccessService.claim), so for those providers this JSON is kept
+    only as the auditable record of what was asked for, not as something enforced at the
+    cloud layer - the size limit is an AWS-specific constraint and is not applied."""
     text = json.dumps(to_document(statements), separators=(",", ":"))
-    if len(text) > MAX_SESSION_POLICY_CHARS:
+    if provider == "aws" and len(text) > MAX_SESSION_POLICY_CHARS:
         raise PolicyError(
             f"policy is {len(text)} characters; AWS allows at most {MAX_SESSION_POLICY_CHARS} "
             "for a session policy. Request fewer or broader-by-resource actions."
@@ -112,37 +148,70 @@ def is_within_ceiling(requested: list[dict], ceiling: list[dict]) -> tuple[bool,
 
 # ---------- action classification and blast radius ----------
 
-READ_PREFIXES = ("get", "list", "describe", "lookup", "search", "view", "head", "batchget", "select", "scan", "query")
+READ_PREFIXES = ("get", "list", "describe", "lookup", "search", "view", "head", "batchget", "select", "scan",
+                 "query", "read")
 DESTRUCTIVE_PREFIXES = ("delete", "terminate", "remove", "destroy", "purge", "disable", "deregister", "revoke", "detach", "stop")
+
+# Per-provider privileged-namespace markers: a service/namespace starting with one of these
+# is treated as identity/access-management territory unless the verb is a plain read.
+_IAM_NAMESPACES = {"aws": ("iam", "organizations"), "azure": ("microsoft.authorization",), "gcp": ("iam", "resourcemanager")}
+
 SECRET_READS = {
-    "secretsmanager:getsecretvalue", "ssm:getparameter", "ssm:getparameters",
-    "ssm:getparametersbypath", "kms:decrypt",
+    "aws": {"secretsmanager:getsecretvalue", "ssm:getparameter", "ssm:getparameters",
+            "ssm:getparametersbypath", "kms:decrypt"},
+    "azure": {"microsoft.keyvault/vaults/secrets/getsecret/action", "microsoft.keyvault/vaults/secrets/read"},
+    "gcp": {"secretmanager.versions.access", "cloudkms.cryptokeyversions.usetodecrypt"},
 }
+# Specific actions (not whole namespaces, except AWS's pre-existing 'organizations:*') that
+# grant or escalate access on their own. A plain read of IAM/authorization/IAM-namespace
+# metadata is deliberately NOT swept in here for any provider - it falls through to the
+# namespace check in classify_action below instead, so "who can see this" and "who can
+# change this" stay distinguishable the same way for every cloud.
 PRIVILEGE_ACTIONS = {
-    "iam:passrole", "iam:attachrolepolicy", "iam:putrolepolicy", "iam:createpolicyversion",
-    "iam:createaccesskey", "iam:updateassumerolepolicy", "iam:attachuserpolicy",
-    "iam:putuserpolicy", "iam:createrole", "iam:createuser", "iam:attachgrouppolicy",
-    "iam:setdefaultpolicyversion", "sts:assumerole", "organizations:*",
+    "aws": {"iam:passrole", "iam:attachrolepolicy", "iam:putrolepolicy", "iam:createpolicyversion",
+            "iam:createaccesskey", "iam:updateassumerolepolicy", "iam:attachuserpolicy",
+            "iam:putuserpolicy", "iam:createrole", "iam:createuser", "iam:attachgrouppolicy",
+            "iam:setdefaultpolicyversion", "sts:assumerole", "organizations:*"},
+    "azure": {"microsoft.keyvault/vaults/accesspolicies/write"},
+    "gcp": {"*.setiampolicy", "iam.serviceaccounts.actas", "iam.serviceaccountkeys.create"},
 }
 
 
-def _split(action: str) -> tuple[str, str]:
-    service, _, name = action.partition(":")
+def _split(action: str, provider: str = "aws") -> tuple[str, str]:
+    """(service-or-namespace, verb), both lower-cased, using each provider's own separator."""
+    if provider == "aws":
+        service, _, name = action.partition(":")
+    elif provider == "azure":
+        service, _, rest = action.partition("/")
+        name = rest.rsplit("/", 1)[-1] if rest else ""
+    elif provider == "gcp":
+        head, _, name = action.rpartition(".")
+        service = head.partition(".")[0]
+    else:
+        raise PolicyError(f"unknown provider {provider!r}")
     return service.lower(), name.lower()
 
 
-def classify_action(action: str) -> str:
+def _matches_any(lower: str, patterns: set[str]) -> bool:
+    """True if `lower` matches one of `patterns`, checking both directions: either side
+    may be the one carrying the wildcard - a caller's own action can be wildcarded (e.g.
+    requesting "secretsmanager:Get*"), and so can an entry in SECRET_READS/PRIVILEGE_ACTIONS
+    (e.g. "*.setiampolicy", AWS's "organizations:*")."""
+    return any(fnmatchcase(p, lower) or fnmatchcase(lower, p) for p in patterns)
+
+
+def classify_action(action: str, provider: str = "aws") -> str:
     """One of: admin, secret-read, privilege, destructive, read, write."""
     if action == "*":
         return "admin"
-    service, name = _split(action)
+    service, name = _split(action, provider)
     if name == "*":
         return "admin"
-    lower = f"{service}:{name}"
-    if any(fnmatchcase(s, lower) for s in SECRET_READS):
+    lower = action.lower()
+    if _matches_any(lower, SECRET_READS[provider]):
         return "secret-read"
-    if any(fnmatchcase(p, lower) for p in PRIVILEGE_ACTIONS) or (
-        service in ("iam", "organizations") and not name.startswith(READ_PREFIXES)
+    if _matches_any(lower, PRIVILEGE_ACTIONS[provider]) or (
+        service in _IAM_NAMESPACES[provider] and not name.startswith(READ_PREFIXES)
     ):
         return "privilege"
     if name.startswith(DESTRUCTIVE_PREFIXES):
@@ -155,7 +224,7 @@ def classify_action(action: str) -> str:
 _RISK_ORDER = ["low", "medium", "high", "critical"]
 
 
-def blast_radius(statements: list[dict]) -> dict:
+def blast_radius(statements: list[dict], provider: str = "aws") -> dict:
     """Plain-language summary of what a policy can reach, plus a risk level."""
     by_cat: dict[str, set[str]] = {}
     services: set[str] = set()
@@ -167,8 +236,8 @@ def blast_radius(statements: list[dict]) -> dict:
             if r == "*":
                 wildcard_resource = True
         for a in s["actions"]:
-            services.add("all services" if a == "*" else _split(a)[0])
-            by_cat.setdefault(classify_action(a), set()).add(a)
+            services.add("all services" if a == "*" else _split(a, provider)[0])
+            by_cat.setdefault(classify_action(a, provider), set()).add(a)
 
     reasons: list[str] = []
     risk = "low"

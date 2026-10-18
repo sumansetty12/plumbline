@@ -1,0 +1,5 @@
+-r requirements.txt
+google-auth>=2.30
+google-cloud-iam>=2.15
+google-cloud-logging>=3.10
+google-api-python-client>=2.130

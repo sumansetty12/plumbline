@@ -1,0 +1,5 @@
+-r requirements.txt
+azure-identity>=1.17
+azure-mgmt-authorization>=4.0
+azure-mgmt-monitor>=6.0
+msgraph-sdk>=1.5

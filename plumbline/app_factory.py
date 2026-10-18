@@ -17,7 +17,7 @@ from .slo import SLOService
 @dataclass
 class Plumbline:
     db: Database
-    gateway: object
+    gateways: dict
     audit: AuditLog
     access: AccessService
     evidence: EvidenceStore
@@ -27,16 +27,26 @@ class Plumbline:
     changes: ChangeRiskService
     slos: SLOService
 
+    @property
+    def gateway(self):
+        """Back-compat for single-cloud (AWS) callers, e.g. demo.py: `pl.gateway`."""
+        return self.gateways["aws"]
+
 
 def build(gateway, db_path: str = ":memory:", clock=utcnow, explainer: Explainer | None = None,
-          max_duration_minutes: int = 480, freeze_windows: list[tuple] | None = None) -> Plumbline:
+          max_duration_minutes: int = 480, freeze_windows: list[tuple] | None = None,
+          gateways: dict | None = None) -> Plumbline:
+    """`gateway` is the AWS gateway, kept as the first positional argument so existing
+    single-cloud callers don't change. For Azure and/or GCP too, pass `gateways` with the
+    extra providers, e.g. build(aws_gw, gateways={"azure": azure_gw, "gcp": gcp_gw})."""
+    gw_map = {"aws": gateway, **(gateways or {})}
     db = Database(db_path)
     audit = AuditLog(db)
-    access = AccessService(db, gateway, audit, clock=clock, max_duration_minutes=max_duration_minutes)
+    access = AccessService(db, gw_map, audit, clock=clock, max_duration_minutes=max_duration_minutes)
     evidence = EvidenceStore(db)
     findings = FindingStore(db, evidence)
-    analyzer = Analyzer(db, gateway, access, evidence, findings, audit, clock=clock)
+    analyzer = Analyzer(db, gw_map, access, evidence, findings, audit, clock=clock)
     changes = ChangeRiskService(db, audit, clock, freeze_windows=freeze_windows)
     slos = SLOService(db, audit, clock)
-    return Plumbline(db, gateway, audit, access, evidence, findings, analyzer,
+    return Plumbline(db, gw_map, audit, access, evidence, findings, analyzer,
                      explainer or TemplateExplainer(), changes, slos)

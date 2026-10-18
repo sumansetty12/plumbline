@@ -7,7 +7,8 @@ import threading
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS contracts (
     id TEXT PRIMARY KEY, contractor TEXT NOT NULL, vendor TEXT NOT NULL, owner TEXT NOT NULL,
-    role_arn TEXT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, ceiling_json TEXT NOT NULL,
+    role_arn TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'aws',
+    starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, ceiling_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS requests (
@@ -19,9 +20,9 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 CREATE TABLE IF NOT EXISTS grants (
     id TEXT PRIMARY KEY, request_id TEXT NOT NULL, contract_id TEXT NOT NULL,
-    contractor TEXT NOT NULL, role_arn TEXT NOT NULL, session_name TEXT NOT NULL,
-    policy_json TEXT NOT NULL, issued_at TEXT NOT NULL, expires_at TEXT NOT NULL,
-    status TEXT NOT NULL, revoked_at TEXT, revoked_reason TEXT
+    contractor TEXT NOT NULL, role_arn TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'aws',
+    session_name TEXT NOT NULL, policy_json TEXT NOT NULL, issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL, status TEXT NOT NULL, revoked_at TEXT, revoked_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS evidence (
     id TEXT PRIMARY KEY, source TEXT NOT NULL, event_time TEXT, event_json TEXT NOT NULL

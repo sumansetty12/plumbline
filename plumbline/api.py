@@ -47,6 +47,8 @@ class ContractIn(BaseModel):
     starts_at: str
     ends_at: str
     ceiling: dict
+    provider: str = "aws"  # "aws", "azure" or "gcp" - see plumbline.identifiers for what
+                           # role_arn needs to look like for each
 
 
 class RequestIn(BaseModel):
@@ -96,7 +98,7 @@ class SLOEventIn(BaseModel):
 
 
 def create_app(pl: Plumbline, keys: dict[str, User]) -> FastAPI:
-    app = FastAPI(title="Plumbline", version="0.3.0")
+    app = FastAPI(title="Plumbline", version="0.4.0")
 
     @app.exception_handler(NotFound)
     async def _nf(_, e):

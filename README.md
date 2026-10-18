@@ -2,9 +2,9 @@
 
 **Engineering guardrails for small teams, with the evidence to back them.**
 
-This first release is the contractor-access module. Small companies give contractors and vendors cloud access, then forget to remove it. Plumbline ties every grant to a contract, expires it automatically, shows the approver what the access can reach, and later checks what the contractor actually did against what they asked for. Every finding links to the exact event behind it.
+This first release is the contractor-access module, for AWS, Azure and GCP. Small companies give contractors and vendors cloud access, then forget to remove it. Plumbline ties every grant to a contract, expires it automatically, shows the approver what the access can reach, and later checks what the contractor actually did against what they asked for. Every finding links to the exact event behind it.
 
-> **Status: early (v0.3).** The core logic is tested (173 tests, CI on Python 3.11 to 3.13). Scope enforcement, the orphan scan, and revocation have all been exercised on a real AWS account; nothing has been run against a live LLM, and the evaluation uses **simulated** data. The change-risk scorer and SLO starter kit (modules 2 and 3) are new and not yet used on a real deployment pipeline or real production traffic. See [What is and isn't tested](#what-is-and-isnt-tested) and [Not built yet](#not-built-yet) before relying on it.
+> **Status: early (v0.4).** The core logic is tested (233 tests, CI on Python 3.11 to 3.13). Scope enforcement, the orphan scan, and revocation have all been exercised on a real **AWS** account; the Azure and GCP gateways are new, correct against their documented SDK shapes and covered by unit tests with injected stand-in clients, but have **not** been run against a live Azure subscription or GCP project — see [Azure and GCP: what's the same, what's not](#azure-and-gcp-whats-the-same-whats-not). Nothing has been run against a live LLM, and the evaluation uses **simulated** data. The change-risk scorer and SLO starter kit (modules 2 and 3) are not yet used on a real deployment pipeline or real production traffic. See [What is and isn't tested](#what-is-and-isnt-tested) and [Not built yet](#not-built-yet) before relying on it.
 
 ## How it works
 
@@ -37,6 +37,7 @@ flowchart LR
 
 | Feature | What it does |
 |---|---|
+| Multi-cloud | A contract names a provider (AWS, Azure or GCP). The request/decide/claim/revoke flow, scope ceiling, blast radius and anomaly detection work the same way on all three; what each one actually does to issue and revoke access is necessarily different — see [Azure and GCP: what's the same, what's not](#azure-and-gcp-whats-the-same-whats-not). |
 | Contract binding | A grant never outlives its contract. Ending a contract revokes its grants and cancels open requests. |
 | Scope ceiling | Each contract carries the most a contractor may ever request. Requests outside it are refused and audited. A requested `s3:*` is **not** inside a ceiling of `s3:Get*`. |
 | Purpose and ticket | A request must state what the access is for and cite a ticket. |
@@ -53,6 +54,24 @@ flowchart LR
 | Change-risk scorer (module 2) | Scores a proposed change from facts you give it — environment, services touched, whether requester and approver are different people, review count, rollback plan and whether it was tested, size, timing, and declared change freezes — as a sum of named, weighted signals. Every score comes with the reasons behind it. |
 | SLO starter kit (module 3) | Define a target (e.g. 99.9% over 30 days), record good/bad events, and get the error budget remaining plus a two-window burn-rate alert (the method from Google's SRE Workbook), so a budget that is burning too fast is flagged before it is gone. |
 | SOC 2 evidence report | `GET /reports/soc2?start=..&end=..` (JSON) and `/reports/soc2.pdf` map what Plumbline recorded to SOC 2 Security criteria CC6.1, CC6.2, CC6.3, CC7.2 and CC7.3, with counts, audit-log integrity and the head hash, open high and critical findings, and a section on what the report does not cover. It is evidence for an auditor, not a statement of compliance. Criterion wording is a paraphrase, not the AICPA text. |
+
+## Azure and GCP: what's the same, what's not
+
+Plumbline's contract/request/decide/claim/revoke flow, scope ceiling, blast-radius preview, orphan scan and anomaly detection all work the same way on all three clouds - a contract names a `provider` ("aws", "azure" or "gcp"), and everything above the gateway layer is written against the clouds' shared shape, not AWS's specifically. What differs is how each cloud actually implements "issue time-limited access" and "take it away again", because the three clouds do not have equivalent primitives. The honest version, cloud by cloud:
+
+| | AWS | Azure | GCP |
+|---|---|---|---|
+| "Issue access" primitive | STS `AssumeRole` | A time-bound RBAC role assignment (Azure AD PIM activation) | IAM Credentials `generateAccessToken` |
+| What `claim()` returns | A real access key, secret and session token | **No bearer credential at all** - access follows the contractor's own Azure AD sign-in once the assignment is active | A real OAuth access token |
+| Session duration | 15 min to 12 h (role's `MaxSessionDuration`) | 5 min to 24 h (Microsoft's PIM guidance) | 10 min to **1 hour** - GCP will not mint a longer-lived token directly |
+| Per-request narrowing | A real inline STS session policy, enforced by AWS | **Not enforced** - Azure RBAC cannot narrow an active assignment below its role; the requested scope is recorded and approved, not technically bounded | **Not enforced**, same reason - a generated token carries the service account's full bindings |
+| Revoking before expiry | A Deny policy keyed on `aws:TokenIssueTime`, ending every session on that role issued before now | Removing the role assignment; Azure re-checks RBAC per request, so this is a real revoke, modulo Microsoft's own documented propagation delay (usually under 5 minutes) | Removing the IAM policy binding so no new token can be minted; an **already-issued token keeps working until it expires** (up to the 1-hour cap) - GCP has no way to invalidate one early |
+| Activity log used | CloudTrail (management events only, 90-day lookback, minutes of lag) | Azure Monitor Activity Log (control-plane only - data-plane calls need Diagnostic Settings, configured per resource) | Cloud Logging Admin Activity logs (control-plane only - Data Access logs are off by default, billed separately, and not available for every service) |
+| Principal reference (`role_arn` field) | An IAM role ARN | `"<service principal object id>@<role-assignment scope>#<role definition id>"` - Azure needs all three to activate an assignment, and there's no single ARN-like id that carries them, so they're packed into one field (see `plumbline/identifiers.py`) | A service account email |
+
+None of this is a Plumbline shortcoming to be fixed later - it is what each cloud's own IAM actually offers. A deployment that needs enforced per-request narrowing on Azure or GCP, not just an audited ask, would need to lean on each cloud's own resource-level IAM Conditions (Azure ABAC, GCP conditional bindings), which only cover specific resource types today and are out of scope here.
+
+Setup: install the matching optional dependency group (`pip install -e .[azure]` or `.[gcp]`; see `requirements-azure.txt` / `requirements-gcp.txt`), make sure that cloud's own credentials are available the way its SDK expects (`az login` or a service principal for Azure; `GOOGLE_APPLICATION_CREDENTIALS` or Application Default Credentials for GCP), and set `PLUMBLINE_AZURE_SUBSCRIPTION_ID` and/or `PLUMBLINE_GCP_PROJECT_ID`. Azure's orphan scan additionally needs a Microsoft Graph client passed in by hand (there is no single official synchronous Graph SDK to default-construct the way boto3 is); without one, `AzureGateway.list_contractor_principals` raises a clear error naming what's missing, and the orphan scan skips just that provider rather than failing outright (the other configured clouds still get scanned - see `Analyzer.scan_orphans`).
 
 ## Try it with no AWS account (demo mode)
 
@@ -79,10 +98,11 @@ Optional LLM explanations: set `ANTHROPIC_API_KEY` (and optionally `PLUMBLINE_MO
 
 | Area | How it is tested |
 |---|---|
-| Policy engine, access flow, analysis, evidence rules, audit chain, API roles | Unit and integration tests (144) |
-| Real `Boto3Gateway` | Against [moto](https://github.com/getmoto/moto) for STS and IAM, and a botocore Stubber for CloudTrail (including pagination) |
+| Policy engine, access flow, analysis, evidence rules, audit chain, API roles | Unit and integration tests (233), across all three providers where the behaviour is provider-specific (duration bounds, action syntax, blast radius, the full request/decide/claim/revoke flow) |
+| Real `Boto3Gateway` (AWS) | Against [moto](https://github.com/getmoto/moto) for STS and IAM, and a botocore Stubber for CloudTrail (including pagination) |
+| `AzureGateway` / `GCPGateway` | Unit-tested by injecting stand-in SDK clients and checking the calls they get (right scope, right principal, right duration bounds, right filters) - this proves Plumbline's own wiring, not that Azure's or GCP's real APIs behave as documented. Unlike `Boto3Gateway`, **neither has been exercised against a live account**; there is no moto-equivalent emulator for either readily available. Treat them as correct-against-the-docs, not field-tested. |
 | LLM explainer | Against a **mock** HTTP transport only. Never called against the live API in this repo's tests |
-| Key rules | Mutation-checked once by hand: breaking the scope check, the contract-end cap, or separation of duties makes tests fail |
+| Key rules | Mutation-checked by hand: breaking the scope check, the contract-end cap, separation of duties, or the GCP IAM-binding removal in `revoke_sessions` all make tests fail. A latent argument-order bug in `classify_action`'s pattern matching (found while adding GCP's `*.setIamPolicy` wildcard, which never actually matched anything until fixed) is also now covered. |
 | Detection quality | Simulated scenarios only (see below) |
 | Real AWS | Scope enforcement, the orphan scan, and revocation were exercised on a personal AWS test account: a real credential issued by Plumbline stopped working immediately after revoke (AWS returned an explicit deny), and the orphan scan correctly flagged an untagged contractor role |
 
@@ -113,11 +133,16 @@ Optional LLM explanations: set `ANTHROPIC_API_KEY` (and optionally `PLUMBLINE_MO
 - **The SLO burn-rate alert needs real traffic to mean anything.** The two-window thresholds are the published values for a 30-day window, scaled by window length; they have not been tuned against a real service's noise.
 - **IAM-user contractors** are found by the orphan scan, but activity from long-lived keys is not matched to grants.
 - **The stated purpose is free text.** The rules cannot judge it. The optional LLM explanation is asked to compare purpose and activity, and its answer is only trusted if its citations check out.
+- **Azure and GCP narrowing is intent-only, not enforced.** Plumbline validates and audits a per-request scope on every provider, but only AWS can actually bound a single grant to less than its role's full permissions (an inline STS session policy). On Azure and GCP the credential (or, for Azure, the activated role) carries the contract's full role - see [Azure and GCP: what's the same, what's not](#azure-and-gcp-whats-the-same-whats-not).
+- **GCP cannot revoke an already-issued token before it expires,** and Azure's and GCP's own documented propagation delays mean a revoked grant's access does not necessarily stop the instant `revoke()` returns on those two clouds, unlike AWS's Deny trick. Same table as above for the specifics.
+- **Azure's orphan scan needs a Microsoft Graph client supplied by hand**, and reports a service principal's `created`/`last_used` as `None` rather than guessing, so the DORMANT check never fires for Azure principals yet (it has no sign-in-logs call wired up). GCP's and Azure's gateways report the same honest `None` for anything they're not actually told, rather than approximating it from AWS's shape.
+- **Neither the Azure nor the GCP gateway has been run against a real account.** They are correct against the documented SDK call shapes and unit-tested with injected stand-in clients, the same way the rest of Plumbline's logic is tested - but AWS is the only cloud this project has actually pointed at a live environment.
 
 ## Not built yet
 
-- Azure and GCP support.
 - Linking a change (module 2) to the access and contractor flow (module 1) — today they are two separate, independently useful features in one codebase, not yet one guardrail pipeline.
+- Resource-level IAM Conditions (Azure ABAC, GCP conditional bindings) that would let a per-request scope actually be enforced on Azure and GCP, not just recorded and approved — see the narrowing limitation above.
+- A live Azure and/or GCP account to validate the two new gateways against, the way AWS already has been.
 
 ## Development
 

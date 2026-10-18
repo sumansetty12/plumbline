@@ -75,13 +75,12 @@ class SLOService:
         observed_percent = round(100 * good / total, 4) if total else None
         budget_total = allowed_bad_rate * total if total else 0.0
         budget_consumed = total - good
-        raw_remaining = (100 * (1 - budget_consumed / budget_total)
-                         if budget_total > 0 else (100.0 if total == 0 else None))
-        budget_remaining_percent = (round(max(raw_remaining, -100.0), 2)
-                                    if raw_remaining is not None else None)
-        # How many times over budget (>1.0 means exceeded; None when budget is zero/unknown)
-        budget_multiple = (round(budget_consumed / budget_total, 1)
-                           if budget_total > 0 else None)
+        if budget_total > 0:
+            budget_remaining_percent = round(max(0.0, 100 * (1 - budget_consumed / budget_total)), 2)
+            budget_consumed_multiple = round(budget_consumed / budget_total, 2)
+        else:
+            budget_remaining_percent = 100.0 if total == 0 else 0.0
+            budget_consumed_multiple = 0.0 if total == 0 else float("inf") if budget_consumed else 0.0
 
         burn: dict[str, dict] = {}
         for label, short_h, long_h, multiple in BURN_RATE_WINDOWS:
@@ -100,5 +99,7 @@ class SLOService:
                 "total_events": total, "good_events": good, "bad_events": budget_consumed,
                 "observed_percent": observed_percent, "error_budget_total_events": round(budget_total, 2),
                 "error_budget_remaining_percent": budget_remaining_percent,
-                "error_budget_multiple": budget_multiple,
+                "error_budget_consumed_multiple": budget_consumed_multiple,
+                "note": ("the sample is too small for this target to mean anything (fewer than 1 allowed bad event)"
+                        if 0 < budget_total < 1 else None),
                 "burn_rate": burn, "alert": any(b["alert"] for b in burn.values())}

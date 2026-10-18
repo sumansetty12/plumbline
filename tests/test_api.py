@@ -105,3 +105,25 @@ def test_demo_seed_works(pl):
     from plumbline.demo import seed
     out = seed(pl)
     assert len(pl.access.list_requests()) == 2 and out["contract"].startswith("ctr_")
+
+
+def test_create_contract_accepts_a_non_aws_provider(client):
+    azure_ref = ("11111111-1111-1111-1111-111111111111@/subscriptions/"
+                "22222222-2222-2222-2222-222222222222/resourceGroups/acme-rg"
+                "#33333333-3333-3333-3333-333333333333")
+    r = client.post("/contracts", headers=H("kz"), json={
+        "contractor": "alice@acme.example", "vendor": "Acme", "owner": "bob@corp.example",
+        "role_arn": azure_ref, "provider": "azure",
+        "starts_at": "2026-01-01T00:00:00Z", "ends_at": "2026-03-31T00:00:00Z",
+        "ceiling": {"Statement": [{"Effect": "Allow",
+                                   "Action": "Microsoft.Storage/storageAccounts/blobServices/containers/read",
+                                   "Resource": "*"}]}})
+    assert r.status_code == 201 and r.json()["provider"] == "azure"
+
+
+def test_create_contract_rejects_a_ref_that_does_not_match_its_provider(client):
+    r = client.post("/contracts", headers=H("kz"), json={
+        "contractor": "alice@acme.example", "vendor": "Acme", "owner": "bob@corp.example",
+        "role_arn": ROLE, "provider": "gcp",  # an AWS-shaped ARN is not a GCP service account email
+        "starts_at": "2026-01-01T00:00:00Z", "ends_at": "2026-03-31T00:00:00Z", "ceiling": CEILING})
+    assert r.status_code == 400
